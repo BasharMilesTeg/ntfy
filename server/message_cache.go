@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3" // SQLite driver
@@ -35,7 +37,7 @@ const (
 			priority INT NOT NULL,
 			tags TEXT NOT NULL,
 			click TEXT NOT NULL,
-			icon TEXT NOT NULL,			
+			icon TEXT NOT NULL,
 			actions TEXT NOT NULL,
 			attachment_name TEXT NOT NULL,
 			attachment_type TEXT NOT NULL,
@@ -72,36 +74,43 @@ const (
 	selectRowIDFromMessageID          = `SELECT id FROM messages WHERE mid = ?` // Do not include topic, see #336 and TestServer_PollSinceID_MultipleTopics
 	selectMessagesByIDQuery           = `
 		SELECT mid, time, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
-		FROM messages 
+		FROM messages
 		WHERE mid = ?
 	`
 	selectMessagesSinceTimeQuery = `
 		SELECT mid, time, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
-		FROM messages 
+		FROM messages
 		WHERE topic = ? AND time >= ? AND published = 1
 		ORDER BY time, id
 	`
 	selectMessagesSinceTimeIncludeScheduledQuery = `
 		SELECT mid, time, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
-		FROM messages 
+		FROM messages
 		WHERE topic = ? AND time >= ?
 		ORDER BY time, id
 	`
 	selectMessagesSinceIDQuery = `
 		SELECT mid, time, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
-		FROM messages 
+		FROM messages
 		WHERE topic = ? AND id > ? AND published = 1 
 		ORDER BY time, id
 	`
 	selectMessagesSinceIDIncludeScheduledQuery = `
 		SELECT mid, time, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
-		FROM messages 
+		FROM messages
 		WHERE topic = ? AND (id > ? OR published = 0)
 		ORDER BY time, id
 	`
+	selectMessagesLatestQuery = `
+		SELECT mid, time, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
+		FROM messages
+		WHERE topic = ? AND published = 1
+		ORDER BY time DESC, id DESC
+		LIMIT 1
+	`
 	selectMessagesDueQuery = `
 		SELECT mid, time, expires, topic, message, title, priority, tags, click, icon, actions, attachment_name, attachment_type, attachment_size, attachment_expires, attachment_url, sender, user, content_type, encoding
-		FROM messages 
+		FROM messages
 		WHERE time <= ? AND published = 0
 		ORDER BY time, id
 	`
@@ -275,10 +284,17 @@ type messageCache struct {
 	db    *sql.DB
 	queue *util.BatchingQueue[*message]
 	nop   bool
+	mu    sync.Mutex
 }
 
 // newSqliteCache creates a SQLite file-backed cache
 func newSqliteCache(filename, startupQueries string, cacheDuration time.Duration, batchSize int, batchTimeout time.Duration, nop bool) (*messageCache, error) {
+	// Check the parent directory of the database file (makes for friendly error messages)
+	parentDir := filepath.Dir(filename)
+	if !util.FileExists(parentDir) {
+		return nil, fmt.Errorf("cache database directory %s does not exist or is not accessible", parentDir)
+	}
+	// Open database
 	db, err := sql.Open("sqlite3", filename)
 	if err != nil {
 		return nil, err
@@ -333,6 +349,8 @@ func (c *messageCache) AddMessage(m *message) error {
 // addMessages synchronously stores a match of messages. If the database is locked, the transaction waits until
 // SQLite's busy_timeout is exceeded before erroring out.
 func (c *messageCache) addMessages(ms []*message) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.nop {
 		return nil
 	}
@@ -416,6 +434,8 @@ func (c *messageCache) addMessages(ms []*message) error {
 func (c *messageCache) Messages(topic string, since sinceMarker, scheduled bool) ([]*message, error) {
 	if since.IsNone() {
 		return make([]*message, 0), nil
+	} else if since.IsLatest() {
+		return c.messagesLatest(topic)
 	} else if since.IsID() {
 		return c.messagesSinceID(topic, since, scheduled)
 	}
@@ -456,6 +476,14 @@ func (c *messageCache) messagesSinceID(topic string, since sinceMarker, schedule
 	} else {
 		rows, err = c.db.Query(selectMessagesSinceIDQuery, topic, rowID)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return readMessages(rows)
+}
+
+func (c *messageCache) messagesLatest(topic string) ([]*message, error) {
+	rows, err := c.db.Query(selectMessagesLatestQuery, topic)
 	if err != nil {
 		return nil, err
 	}
@@ -504,6 +532,8 @@ func (c *messageCache) Message(id string) (*message, error) {
 }
 
 func (c *messageCache) MarkPublished(m *message) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	_, err := c.db.Exec(updateMessagePublishedQuery, m.ID)
 	return err
 }
@@ -549,6 +579,8 @@ func (c *messageCache) Topics() (map[string]*topic, error) {
 }
 
 func (c *messageCache) DeleteMessages(ids ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	tx, err := c.db.Begin()
 	if err != nil {
 		return err
@@ -563,6 +595,8 @@ func (c *messageCache) DeleteMessages(ids ...string) error {
 }
 
 func (c *messageCache) ExpireMessages(topics ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	tx, err := c.db.Begin()
 	if err != nil {
 		return err
@@ -597,6 +631,8 @@ func (c *messageCache) AttachmentsExpired() ([]string, error) {
 }
 
 func (c *messageCache) MarkAttachmentsDeleted(ids ...string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	tx, err := c.db.Begin()
 	if err != nil {
 		return err
@@ -742,6 +778,8 @@ func readMessage(rows *sql.Rows) (*message, error) {
 }
 
 func (c *messageCache) UpdateStats(messages int64) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	_, err := c.db.Exec(updateStatsQuery, messages)
 	return err
 }
